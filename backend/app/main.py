@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,6 +14,7 @@ from app.config import settings
 from app.routers import ROUTERS
 from app.store import store
 from app.services import runtime_session, callback_hook
+from app.services.export_jobs import ExportJobError, export_jobs
 
 app = FastAPI(title="RPA流程自动化中心", version="1.0.0")
 
@@ -33,6 +36,58 @@ def health() -> dict[str, object]:
 def overview() -> dict[str, object]:
     """运营概览：把各业务模块的待处理量汇总成看板卡片。"""
     return store.overview()
+
+
+# ---- 输出工作台：分段导出进度 ----
+
+@app.get("/api/export-workbench")
+def export_workbench() -> dict[str, object]:
+    """输出工作台数据源：导出任务的分段进度、校验和、保存状态与回执。
+
+    这里只暴露已提交完成标记的任务的下载入口；失败/半成品的导出
+    会挂在 ``incomplete`` 下，便于续写，但不会出现在可下载列表。
+    """
+    jobs = export_jobs.list_jobs()
+    downloadable = [job for job in jobs if job["downloadable"]]
+    incomplete = [job for job in jobs if not job["downloadable"]]
+    return {
+        "stats": export_jobs.stats(),
+        "jobs": downloadable,
+        "incomplete": incomplete,
+        "receipts": export_jobs.list_receipts(),
+    }
+
+
+@app.post("/api/export-workbench/consume")
+def export_workbench_consume() -> dict[str, object]:
+    """让回调钩子消费导出完成事件，清单完整的任务各签发一次交付回执。"""
+    return callback_hook.consume_exports_and_deliver()
+
+
+@app.get("/api/exports/{job_id}/manifest")
+def export_manifest(job_id: str) -> dict[str, object]:
+    """完成标记（文件清单）内容；不存在时说明导出尚未完整提交。"""
+    try:
+        job = export_jobs.get_job(job_id)
+    except ExportJobError as exc:
+        return {"ok": False, "job_id": job_id, "error": str(exc), "code": exc.code}
+    if not job["manifest_ready"]:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "status": job["status"],
+            "confirmed_segments": job["confirmed_segments"],
+            "segment_count": job["segment_count"],
+            "message": "文件清单尚未完整，导出不可下载",
+        }
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "manifest_checksum": job["manifest_checksum"],
+        "final": job["final"],
+        "segments": job["segments"],
+        "downloadable": job["downloadable"],
+    }
 
 
 # ---- 跨模块数据流 API ----
@@ -148,7 +203,6 @@ def pipeline_rpa_lifecycle() -> dict[str, object]:
         BotDefinitionService, StepEditorService, TaskQueueService,
         PageModelService, DataExtractService, ResultVerifyService,
     )
-
     results: dict[str, Any] = {}
     errors: list[str] = []
 

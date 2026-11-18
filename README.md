@@ -16,7 +16,9 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/exports.py   分段导出接口（续写、分段下载、回执）
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/export_jobs.py 分段导出引擎（断点续写 + 原子发布）
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
@@ -78,6 +80,54 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 分段导出与断点续写
+
+「输出工作台」（`/workbench`）把一次导出拆成可独立提交的分段，解决大批量
+一次性拼接字符串、下载中断后从头重来的问题。
+
+**流程**
+
+1. `POST /api/exports/jobs` 读取采集记录 + 输出模板，按窗口（`batch_ref` /
+   `entry_start..entry_end` / `offset+limit`）解析字段映射、分隔符、编码和空值表示，
+   算出分段边界与每段校验和，写出快照与计划（不保留整份格式化字符串）。
+2. `run` / `resume` 只写缺失或校验和不匹配的分段；已确认分段直接跳过，
+   **失败恢复不会重新下载已确认的数据分段**。
+3. 每段先写临时文件并 fsync，再 `os.replace` 原子落位；全部分段确认后才拼装
+   最终文件，并最后原子写入 `manifest.json` 作为完成标记。
+4. 完成标记落定后发布 `rpa.export_completed` 事件（只带清单引用，不含文件内容），
+   回调钩子按任务展开完整文件，**清单完整后才签发交付回执，每个任务最多一条**。
+5. 未完成的导出不出现在可下载列表，也不能下载；分段文件与完成标记同时提交，
+   最终文件不会包含半成品行。
+
+**并发与版本**
+
+- 同一指纹（模板 + 窗口 + 分段大小 + 记录快照）只接受首个成功结果；后到的
+  版本在提交时发现已有完成版本会落到 `superseded` 终态，`delivery_state=conflict`，
+  不发布文件、不产生回执，并发 `rpa.export_conflict` 事件。
+- 部分分段已下载而最终清单未完成时，两种处理都只向回调暴露完整文件：
+  续写当前任务（`POST /api/exports/jobs/{id}/resume`），或
+  `new_version=true` 发布新版本重新汇总。
+- 清单带 `schema_version` 版本边界：未知版本不会被旧代码当作完整文件交付。
+
+**接口**
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/export-workbench` | 工作台：进度、校验和、保存状态、回执 |
+| POST | `/api/export-workbench/consume` | 回调钩子消费完成事件并签发回执 |
+| POST | `/api/exports/jobs` | 创建分段导出（`auto_run` 默认写入全部分段） |
+| GET | `/api/exports/jobs` | 任务清单（`downloadable_only=true` 只列完整文件） |
+| GET | `/api/exports/jobs/{id}` | 单任务分段进度与校验和 |
+| POST | `/api/exports/jobs/{id}/run` | 续写缺失分段（可注入中断用于演练） |
+| POST | `/api/exports/jobs/{id}/resume` | 失败恢复续写 |
+| GET | `/api/exports/jobs/{id}/segments/{n}` | 下载单个已确认分段 |
+| GET | `/api/exports/jobs/{id}/download` | 下载完整文件（清单未完成返回 409） |
+| GET | `/api/exports/{id}/manifest` | 查看完成标记 |
+| GET | `/api/exports/receipts` | 交付回执列表 |
+
+导出文件默认落在 `backend/var/exports/`（可用 `RPA_EXPORT_ROOT` 覆盖），已在
+`.gitignore` 中排除。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

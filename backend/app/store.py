@@ -69,8 +69,13 @@ class DataChannel:
             return msg
 
     def consume(self, consumer: str, topic: str | None = None,
-                since_msg_id: int | None = None) -> list[ChannelMessage]:
-        """获取指定 consumer 尚未消费的消息。"""
+                since_msg_id: int | None = None,
+                include_unconfirmed: bool = False) -> list[ChannelMessage]:
+        """获取指定 consumer 尚未消费的消息。
+
+        include_unconfirmed=True 时，已消费但未确认的消息会被重新投递，
+        供“条件不满足先跳过、补齐后再消费”的场景使用。
+        """
         with self._lock:
             results: list[ChannelMessage] = []
             for msg in self._messages:
@@ -78,9 +83,11 @@ class DataChannel:
                     continue
                 if since_msg_id is not None and msg.msg_id <= since_msg_id:
                     continue
-                if consumer not in msg.consumed_by:
-                    results.append(msg)
-                    msg.mark_consumed(consumer)
+                if consumer in msg.consumed_by:
+                    if not (include_unconfirmed and not msg.confirmed):
+                        continue
+                results.append(msg)
+                msg.mark_consumed(consumer)
             return results
 
     def confirm(self, msg_id: int, consumer: str) -> bool:
@@ -243,6 +250,11 @@ class CollectRecordStore:
             )
             self._entries.append(entry)
             return entry
+
+    def all_entries(self) -> list[CollectEntry]:
+        """返回全部采集记录快照，供导出等下游消费者读取。"""
+        with self._lock:
+            return list(self._entries)
 
     def list_by_batch(self, batch_ref: str) -> list[CollectEntry]:
         with self._lock:

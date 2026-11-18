@@ -56,19 +56,36 @@ def export_entries(
     }
     items, _ = service.list_entries(
         filters=filters, keyword=keyword, status=status, page=1, size=1_000_000)
-    output = io.StringIO()
-    output.write("\ufeff")
-    writer = csv.writer(output, lineterminator="\n")
-    writer.writerow(["id", *service.LIST_FIELDS, "status"])
-    for item in items:
-        values = [item.get("id"), *(item.get(field, "") for field in service.LIST_FIELDS),
-                  item.get("status", "")]
-        writer.writerow([
-            "'" + str(value) if str(value or "").startswith(("=", "+", "-", "@")) else value
-            for value in values
-        ])
+
+    def rows():
+        # \u5206\u6279\u751f\u6210\uff0c\u907f\u514d\u5927\u6279\u6b21\u4e00\u6b21\u6027\u62fc\u6210\u6574\u4efd\u5b57\u7b26\u4e32\u3002
+        buffer = io.StringIO()
+        buffer.write("\ufeff")
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(["id", *service.LIST_FIELDS, "status"])
+
+        def flush() -> str:
+            chunk = buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+            return chunk
+
+        yield flush()
+        for position, item in enumerate(items, start=1):
+            values = [item.get("id"), *(item.get(field, "") for field in service.LIST_FIELDS),
+                      item.get("status", "")]
+            writer.writerow([
+                "'" + str(value) if str(value or "").startswith(("=", "+", "-", "@")) else value
+                for value in values
+            ])
+            if position % 500 == 0:
+                yield flush()
+        trailing = flush()
+        if trailing:
+            yield trailing
+
     return StreamingResponse(
-        iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
+        rows(), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{module}.csv"'},
     )
 

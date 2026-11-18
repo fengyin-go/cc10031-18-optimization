@@ -7,6 +7,13 @@
     channel("rpa.validation_complete") ← result_verify
     → callback_hook 消费 → 模拟下游系统回调（Webhook, MQ, HTTP）
     → channel("rpa.callback_executed")
+
+    channel("rpa.export_completed") ← export_jobs
+    → callback_hook 展开完成发布的导出任务（消息里不带格式化文件）
+    → 仅在文件清单完整时签发交付回执 → channel("rpa.export_delivery_receipt")
+
+两种处理选择（追加当前文件 / 发布新版本重新汇总）都只向回调暴露完整文件：
+未携带 manifest 的导出任务会被跳过，不确认消息，等分段补齐后再交付。
 """
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from app.services.export_jobs import EXPORT_TOPIC, RECEIPT_TOPIC, export_jobs
 from app.store import store
 
 
@@ -153,6 +161,124 @@ class CallbackHookService:
             return [c for c in self._callbacks if c["batch_ref"] == batch_ref]
         return list(self._callbacks)
 
+    # ------------------------------------------------------------------
+    # 导出交付回执：消费完成发布的导出任务，展开为完整文件后再回执
+    # ------------------------------------------------------------------
+
+    def consume_exports_and_deliver(self) -> dict[str, Any]:
+        """消费 channel("rpa.export_completed")，按导出任务展开交付。
+
+        事件负载只带 job_id / 清单校验和，**不含格式化输出文件内容**。
+        这里按任务约定展开完整文件：只有 manifest 就绪、所有分段确认、
+        校验和自洽时才签发一次交付回执；同一个 job 重复投递不会重复回执。
+        清单未完成的事件保持未确认，等恢复续写后再次消费。
+
+        Returns:
+            {"observed": int, "delivered": int, "deferred": int,
+             "conflicts": int, "details": [...]}
+        """
+        msgs = store.channel.consume(
+            consumer=self.SERVICE_NAME,
+            topic=EXPORT_TOPIC,
+            include_unconfirmed=True,
+        )
+        details: list[dict[str, Any]] = []
+        delivered = 0
+        deferred = 0
+        conflicts = 0
+
+        for msg in msgs:
+            payload = msg.payload or {}
+            job_id = str(payload.get("job_id") or "")
+            job = self._load_export_job(job_id)
+            if job is None:
+                # 事件引用了不存在的任务：确认掉，避免反复投递毒消息。
+                store.channel.confirm(msg.msg_id, self.SERVICE_NAME)
+                details.append({"job_id": job_id, "state": "missing"})
+                continue
+
+            if job.get("status") == "superseded" or job.get("delivery_state") == "conflict":
+                conflicts += 1
+                store.channel.confirm(msg.msg_id, self.SERVICE_NAME)
+                details.append({
+                    "job_id": job_id,
+                    "state": "conflict",
+                    "superseded_by": job.get("superseded_by"),
+                })
+                continue
+
+            if not job.get("downloadable") or not job.get("manifest_ready"):
+                # 文件清单不完整：不交付、不确认，保留待续写后再处理。
+                deferred += 1
+                details.append({
+                    "job_id": job_id,
+                    "state": "deferred",
+                    "confirmed_segments": job.get("confirmed_segments"),
+                    "segment_count": job.get("segment_count"),
+                })
+                continue
+
+            expected = payload.get("manifest_checksum")
+            if expected and expected != job.get("manifest_checksum"):
+                deferred += 1
+                details.append({
+                    "job_id": job_id,
+                    "state": "manifest_mismatch",
+                    "manifest_checksum": job.get("manifest_checksum"),
+                })
+                continue
+
+            receipt, created = export_jobs.issue_delivery_receipt(
+                job_id, consumer=self.SERVICE_NAME)
+            if receipt is None:
+                deferred += 1
+                details.append({"job_id": job_id, "state": "deferred"})
+                continue
+
+            if created:
+                delivered += 1
+                store.channel.publish(
+                    topic=RECEIPT_TOPIC,
+                    source=self.SERVICE_NAME,
+                    payload={
+                        "receipt_id": receipt["receipt_id"],
+                        "job_id": job_id,
+                        "version": receipt["version"],
+                        "template_id": receipt["template_id"],
+                        "manifest_checksum": receipt["manifest_checksum"],
+                        "final_filename": receipt["final_filename"],
+                        "final_checksum": receipt["final_checksum"],
+                        "total_rows": receipt["total_rows"],
+                        "download_url": receipt["download_url"],
+                        "delivered_at": receipt["delivered_at"],
+                    },
+                )
+            store.channel.confirm(msg.msg_id, self.SERVICE_NAME)
+            details.append({
+                "job_id": job_id,
+                "state": "delivered" if created else "already_delivered",
+                "receipt_id": receipt["receipt_id"],
+            })
+
+        return {
+            "observed": len(msgs),
+            "delivered": delivered,
+            "deferred": deferred,
+            "conflicts": conflicts,
+            "details": details,
+        }
+
+    @staticmethod
+    def _load_export_job(job_id: str) -> dict[str, Any] | None:
+        try:
+            return export_jobs.get_job(job_id)
+        except Exception:  # noqa: BLE001 - 毒事件按不存在处理
+            return None
+
+    def delivery_receipts(self, job_id: str | None = None) -> list[dict[str, Any]]:
+        """查询已签发的交付回执。"""
+        return export_jobs.list_receipts(job_id)
+
     def get_callback_stats(self) -> dict[str, Any]:
         """获取回调统计。"""
         total = len(self._callbacks)
@@ -161,6 +287,7 @@ class CallbackHookService:
             "total_callbacks": total,
             "successful": successful,
             "failed": total - successful,
+            "delivery_receipts": len(export_jobs.list_receipts()),
         }
 
     def domain_snapshot(self) -> dict[str, Any]:
@@ -172,6 +299,8 @@ class CallbackHookService:
             **stats,
             "callback_events": len(
                 store.channel.snapshot(topic="rpa.callback_executed")),
+            "export_events": len(store.channel.snapshot(topic=EXPORT_TOPIC)),
+            "receipt_events": len(store.channel.snapshot(topic=RECEIPT_TOPIC)),
         }
 
 
